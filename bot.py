@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import httpx
 from datetime import datetime, date
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -10,25 +11,33 @@ from telegram.ext import (
 
 # ─── إعدادات ───────────────────────────────────────────────
 TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
+NOTION_DB_ID = os.environ.get("NOTION_DB_ID", "")
 DATA_FILE = "habits_data.json"
+
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Content-Type": "application/json",
+    "Notion-Version": "2022-06-28"
+}
 
 # ─── العادات اليومية ────────────────────────────────────────
 HABITS = [
-    {"id": "fajr",    "name": "🌅 صلاة الفجر"},
-    {"id": "dhuhr",   "name": "☀️ صلاة الظهر"},
-    {"id": "asr",     "name": "🌤️ صلاة العصر"},
-    {"id": "maghrib", "name": "🌇 صلاة المغرب"},
-    {"id": "isha",    "name": "🌙 صلاة العشاء"},
-    {"id": "quran",   "name": "📖 قراءة القرآن"},
-    {"id": "morning", "name": "🌿 أذكار الصباح"},
-    {"id": "evening", "name": "🌙 أذكار المساء"},
-    {"id": "reading", "name": "📚 قراءة عامة"},
+    {"id": "fajr",    "name": "🌅 صلاة الفجر",   "notion": "صلاة الفجر"},
+    {"id": "dhuhr",   "name": "☀️ صلاة الظهر",   "notion": "صلاة الظهر"},
+    {"id": "asr",     "name": "🌤️ صلاة العصر",   "notion": "صلاة العصر"},
+    {"id": "maghrib", "name": "🌇 صلاة المغرب",  "notion": "صلاة المغرب"},
+    {"id": "isha",    "name": "🌙 صلاة العشاء",   "notion": "صلاة العشاء"},
+    {"id": "quran",   "name": "📖 قراءة القرآن",  "notion": "قراءة القرآن"},
+    {"id": "morning", "name": "🌿 أذكار الصباح",  "notion": "أذكار الصباح"},
+    {"id": "evening", "name": "🌙 أذكار المساء",  "notion": "أذكار المساء"},
+    {"id": "reading", "name": "📚 قراءة عامة",    "notion": "قراءة عامة"},
 ]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─── قاعدة البيانات (ملف JSON) ─────────────────────────────
+# ─── قاعدة البيانات المحلية ─────────────────────────────────
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -42,7 +51,7 @@ def save_data(data):
 def get_user(data, user_id):
     uid = str(user_id)
     if uid not in data:
-        data[uid] = {"history": {}}
+        data[uid] = {"history": {}, "notion_pages": {}}
     return data[uid]
 
 def today_str():
@@ -54,6 +63,69 @@ def get_today_habits(data, user_id):
     if today not in user["history"]:
         user["history"][today] = {h["id"]: False for h in HABITS}
     return user["history"][today]
+
+# ─── Notion API ─────────────────────────────────────────────
+async def create_notion_page(today: str, habits: dict) -> str:
+    """إنشاء صفحة جديدة في Notion لليوم"""
+    done = sum(1 for v in habits.values() if v)
+    total = len(HABITS)
+    percent = int(done / total * 100)
+
+    properties = {
+        "التاريخ": {"date": {"start": today}},
+        "الإنجاز %": {"number": percent},
+    }
+    for habit in HABITS:
+        properties[habit["notion"]] = {"checkbox": habits.get(habit["id"], False)}
+
+    payload = {
+        "parent": {"database_id": NOTION_DB_ID},
+        "properties": properties
+    }
+
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            "https://api.notion.com/v1/pages",
+            headers=NOTION_HEADERS,
+            json=payload
+        )
+        data = res.json()
+        return data.get("id", "")
+
+async def update_notion_page(page_id: str, habits: dict):
+    """تحديث صفحة موجودة في Notion"""
+    done = sum(1 for v in habits.values() if v)
+    total = len(HABITS)
+    percent = int(done / total * 100)
+
+    properties = {"الإنجاز %": {"number": percent}}
+    for habit in HABITS:
+        properties[habit["notion"]] = {"checkbox": habits.get(habit["id"], False)}
+
+    async with httpx.AsyncClient() as client:
+        await client.patch(
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=NOTION_HEADERS,
+            json={"properties": properties}
+        )
+
+async def sync_to_notion(data: dict, user_id: int, habits: dict):
+    """مزامنة عادات اليوم مع Notion"""
+    if not NOTION_TOKEN or not NOTION_DB_ID:
+        return
+    try:
+        user = get_user(data, user_id)
+        today = today_str()
+        notion_pages = user.get("notion_pages", {})
+
+        if today in notion_pages:
+            await update_notion_page(notion_pages[today], habits)
+        else:
+            page_id = await create_notion_page(today, habits)
+            if page_id:
+                user["notion_pages"][today] = page_id
+    except Exception as e:
+        logger.error(f"Notion sync error: {e}")
 
 # ─── لوحة مفاتيح العادات ───────────────────────────────────
 def build_keyboard(checked: dict):
@@ -69,7 +141,7 @@ def build_keyboard(checked: dict):
         ])
     keyboard.append([
         InlineKeyboardButton("📊 تقرير الأسبوع", callback_data="weekly"),
-        InlineKeyboardButton("💾 حفظ اليوم", callback_data="save_day"),
+        InlineKeyboardButton("☁️ حفظ في Notion", callback_data="save_notion"),
     ])
     return InlineKeyboardMarkup(keyboard)
 
@@ -83,7 +155,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• /check — تشيك العادات اليومية\n"
         "• /report — تقرير الأسبوع\n"
         "• /streak — سلسلة الإنجاز\n\n"
-        "سيسألك البوت كل يوم بعد صلاة العشاء 🌙"
+        "سيسألك البوت كل يوم بعد صلاة العشاء 🌙\n"
+        "📓 مرتبط بـ Notion تلقائياً"
     )
 
 async def check_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -117,6 +190,10 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         today[hid] = not today.get(hid, False)
         save_data(data)
 
+        # مزامنة تلقائية مع Notion
+        await sync_to_notion(data, user_id, today)
+        save_data(data)
+
         done = sum(1 for v in today.values() if v)
         total = len(HABITS)
         bar = progress_bar(done, total)
@@ -129,35 +206,23 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    elif action == "save_day":
+    elif action == "save_notion":
         today = get_today_habits(data, user_id)
+        await sync_to_notion(data, user_id, today)
+        save_data(data)
         done = sum(1 for v in today.values() if v)
         total = len(HABITS)
-        msg = generate_day_summary(today, done, total)
-        save_data(data)
-        await query.edit_message_text(msg, parse_mode="Markdown")
+        await query.edit_message_text(
+            f"☁️ *تم الحفظ في Notion!*\n\n"
+            f"📋 {today_str()}\n"
+            f"{progress_bar(done, total)} {done}/{total}\n\n"
+            "افتح Notion لترى السجل 📓",
+            parse_mode="Markdown"
+        )
 
     elif action == "weekly":
         msg = generate_weekly_report(data, user_id)
         await query.edit_message_text(msg, parse_mode="Markdown")
-
-# ─── تقرير يومي ─────────────────────────────────────────────
-def generate_day_summary(today: dict, done: int, total: int) -> str:
-    lines = [f"📅 *ملخص اليوم — {today_str()}*\n"]
-    for habit in HABITS:
-        icon = "✅" if today.get(habit["id"]) else "❌"
-        lines.append(f"{icon} {habit['name']}")
-    percent = int(done / total * 100)
-    bar = progress_bar(done, total)
-    lines.append(f"\n{bar}")
-    lines.append(f"*الإنجاز: {done}/{total} ({percent}%)*")
-    if percent == 100:
-        lines.append("\n🌟 ما شاء الله! يوم مكتمل!")
-    elif percent >= 70:
-        lines.append("\n👍 أداء جيد، واصل!")
-    else:
-        lines.append("\n💪 لا تيأس، غداً فرصة جديدة!")
-    return "\n".join(lines)
 
 # ─── تقرير أسبوعي ───────────────────────────────────────────
 async def report_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -183,7 +248,6 @@ def generate_weekly_report(data: dict, user_id: int) -> str:
     if not dates:
         return "لا يوجد سجل بعد، ابدأ بـ /check ✅"
 
-    # إحصاء كل عادة
     lines.append("\n📈 *أداء كل عادة:*")
     for habit in HABITS:
         hid = habit["id"]
@@ -193,7 +257,7 @@ def generate_weekly_report(data: dict, user_id: int) -> str:
 
     return "\n".join(lines)
 
-# ─── سلسلة الإنجاز Streak ──────────────────────────────────
+# ─── سلسلة الإنجاز ──────────────────────────────────────────
 async def streak_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     user = get_user(data, update.effective_user.id)
@@ -213,11 +277,11 @@ async def streak_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = "🔥 سلسلتك: 0 يوم\nأكمل كل العادات ليوم واحد لتبدأ السلسلة!"
     else:
         fire = "🔥" * min(streak, 10)
-        msg = f"{fire}\n*سلسلة الأيام المكتملة: {streak} يوم متواصل!*\n\nواصل الثبات، لا تكسر السلسلة! 💪"
+        msg = f"{fire}\n*سلسلة الأيام المكتملة: {streak} يوم متواصل!*\n\nواصل الثبات! 💪"
 
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ─── تذكير يومي تلقائي ──────────────────────────────────────
+# ─── تذكير يومي ─────────────────────────────────────────────
 async def daily_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     for user_id in data.keys():
@@ -256,14 +320,13 @@ def main():
     app.add_handler(CommandHandler("streak", streak_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # تذكير يومي الساعة 22:00 (توقيت الجزائر = UTC+1)
     job_queue: JobQueue = app.job_queue
     job_queue.run_daily(
         daily_reminder,
-        time=datetime.strptime("21:00", "%H:%M").time(),  # 22:00 الجزائر = 21:00 UTC
+        time=datetime.strptime("21:00", "%H:%M").time(),
     )
 
-    logger.info("✅ البوت يعمل...")
+    logger.info("✅ البوت يعمل مع Notion...")
     app.run_polling()
 
 if __name__ == "__main__":
